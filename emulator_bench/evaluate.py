@@ -8,7 +8,13 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .results import (
     choose_f1_thresholds,
@@ -128,7 +134,7 @@ def predict_split(model, metadata, split_name, batch_size, num_workers, device):
 
     model.eval()
     with torch.no_grad():
-        for tokens, target, mask, indices in tqdm(
+        for tokens, target, mask, indices in progress(
             loader,
             desc="{} predictions".format(split_name),
             unit="batch",

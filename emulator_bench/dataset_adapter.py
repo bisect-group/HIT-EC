@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .utils import (
     DEFAULT_MODEL_DIMENSION,
@@ -173,7 +179,7 @@ def build_ec_vocab(dataset_root, vocab_path=DEFAULT_VOCAB_PATH, rebuild=False):
     usable_items = 0
     max_depth_counts = {"1": 0, "2": 0, "3": 0, "4": 0}
 
-    for value in tqdm(df["ec_number"], desc="building EC vocabulary", unit="row"):
+    for value in progress(df["ec_number"], desc="building EC vocabulary", unit="row"):
         for item in parse_label_set(value):
             total_items += 1
             prefixes = item["prefixes"]
@@ -305,7 +311,7 @@ def load_hitec_records(
     rows = []
     no_label_rows = 0
     dropped_vocab_prefixes = 0
-    for row in tqdm(
+    for row in progress(
         grouped_for_processing.to_dict("records"),
         total=len(grouped_for_processing),
         desc="{} labels".format(split_name),
