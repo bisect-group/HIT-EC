@@ -175,11 +175,17 @@ def submit_ts_job(
 
 
 def wait_for_ts_jobs(job_ids, spooler_bin=None, poll_seconds=10.0):
-    from tqdm import tqdm
+    try:
+        from src.utils.rich_progress import progress
+    except ModuleNotFoundError:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        from src.utils.rich_progress import progress
 
     spooler = find_ts(spooler_bin)
     remaining = {str(job_id) for job_id in job_ids}
-    with tqdm(total=len(remaining), desc="ts jobs", unit="job") as progress:
+    with progress(total=len(remaining), desc="ts jobs", unit="job") as progress:
         while remaining:
             finished = []
             for job_id in sorted(remaining):

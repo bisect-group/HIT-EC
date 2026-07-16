@@ -4,7 +4,13 @@ import argparse
 from pathlib import Path
 
 import torch
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .dataset_adapter import (
     build_ec_vocab,
@@ -110,7 +116,7 @@ def populate_token_cache(metadata, cache_root, max_tokens):
     for split_name, manifest_path in metadata["manifests"].items():
         df = pd.read_csv(manifest_path)
         token_paths = []
-        iterator = tqdm(
+        iterator = progress(
             df.itertuples(index=False),
             total=len(df),
             desc="{} {} tokens".format(metadata["split_group"], split_name),

@@ -5,7 +5,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .dataset_adapter import _ec_sort_key, ec_prefixes, parse_label_set
 
@@ -20,7 +26,7 @@ def choose_f1_thresholds(probs, targets, masks):
     thresholds = np.full(n_classes, 0.5, dtype=np.float32)
     stats = {"classes": int(n_classes), "no_observed": 0, "no_positive": 0}
 
-    for col in tqdm(range(n_classes), desc="validation thresholds", unit="class"):
+    for col in progress(range(n_classes), desc="validation thresholds", unit="class"):
         observed = masks[:, col] > 0
         if not np.any(observed):
             stats["no_observed"] += 1
@@ -203,7 +209,7 @@ def rank_full_ecs(probs, vocab, rank_limit=50):
     l4_probs = probs[:, l4_start : l4_start + len(l4_labels)]
     limit = len(l4_labels) if rank_limit is None or rank_limit <= 0 else min(rank_limit, len(l4_labels))
     ranked_rows = []
-    for row in tqdm(l4_probs, desc="CARE ranks", unit="row"):
+    for row in progress(l4_probs, desc="CARE ranks", unit="row"):
         top = np.argsort(-row)[:limit]
         ranked_rows.append([l4_labels[index] for index in top])
     return ranked_rows
