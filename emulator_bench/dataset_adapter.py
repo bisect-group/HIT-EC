@@ -6,22 +6,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
-    from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 from .utils import (
-    DEFAULT_MODEL_DIMENSION,
-    DEFAULT_RUNS_ROOT,
-    DEFAULT_VOCAB_PATH,
+    MODEL_DIMENSION,
     SPLIT_NAMES,
-    cache_key_for_entry,
     ensure_dir,
-    resolve_path,
+    split_run_root,
     split_group_slug,
     write_json,
 )
@@ -29,6 +27,7 @@ from .utils import (
 
 REQUIRED_COLUMNS = {"uniprot_id", "sequence", "ec_number"}
 OPTIONAL_METADATA_COLUMNS = ["uniprot_date", "pdbs", "pdb_source", "pdb_type", "pdb_count"]
+VOCAB_POLICY = "full_ec_prefixes"
 AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWYX")
 
 
@@ -38,19 +37,30 @@ class SplitGroup:
     path: Path
 
 
+FLAT_SPLIT_GROUPS = ("random_splits_grouped_sequence", "uniprot_time_splits")
+THRESHOLD_SPLIT_GROUPS = ("enzyme_sequence_splits", "enzyme_structure_splits")
+DEFAULT_SPLIT_GROUPS = FLAT_SPLIT_GROUPS + THRESHOLD_SPLIT_GROUPS
+
+
 def discover_split_groups(dataset_root):
-    root = resolve_path(dataset_root)
+    """Default split folders on disk. Threshold folders are read from disk, never hardcoded."""
+    root = Path(dataset_root).resolve()
     if not root.exists():
         raise FileNotFoundError("Dataset root does not exist: {}".format(root))
 
-    groups = []
-    for train_file in sorted(root.rglob("train.parquet")):
-        parent = train_file.parent
-        if all((parent / "{}.parquet".format(split)).exists() for split in SPLIT_NAMES):
-            groups.append(SplitGroup(parent.relative_to(root).as_posix(), parent))
-
+    candidates = []
+    for name in DEFAULT_SPLIT_GROUPS:
+        folder = root / name
+        candidates.extend(
+            sorted(folder.glob("threshold_*")) if name in THRESHOLD_SPLIT_GROUPS else [folder]
+        )
+    groups = [
+        SplitGroup(folder.relative_to(root).as_posix(), folder)
+        for folder in candidates
+        if all((folder / "{}.parquet".format(split)).exists() for split in SPLIT_NAMES)
+    ]
     if not groups:
-        raise FileNotFoundError("No train/val/test split groups found under {}".format(root))
+        raise FileNotFoundError("No train/val/test split folders found under {}".format(root))
     return groups
 
 
@@ -70,10 +80,6 @@ def select_split_groups(dataset_root, requested=None):
 def normalize_sequence(sequence):
     text = "".join(str(sequence).split()).upper()
     return "".join(char if char in AMINO_ACIDS else "X" for char in text)
-
-
-def sequence_sha256(sequence):
-    return hashlib.sha256(sequence.encode("utf-8")).hexdigest()
 
 
 def split_ec_labels(value):
@@ -99,11 +105,11 @@ def ec_prefixes(label):
 
 
 def parse_label_set(value):
-    raw_labels = split_ec_labels(value)
+    """Full ECs (four levels, no "-" or "n" parts) of a label string; partial ECs are dropped."""
     parsed = []
-    for label in raw_labels:
+    for label in split_ec_labels(value):
         prefixes = ec_prefixes(label)
-        if prefixes:
+        if len(prefixes) == 4:
             parsed.append({"label": label, "prefixes": prefixes, "depth": len(prefixes)})
     return parsed
 
@@ -119,6 +125,16 @@ def _first_non_null(values):
         if pd.notna(value):
             return value
     return None
+
+
+def _union_ids(values):
+    ids = set()
+    for value in values:
+        if isinstance(value, str):
+            ids.update(item for item in value.split(";") if item)
+        elif pd.api.types.is_list_like(value):
+            ids.update(str(item) for item in value)
+    return ";".join(sorted(ids)) or None
 
 
 def _parquet_columns(path):
@@ -163,11 +179,12 @@ def _read_parquet_columns(path, columns, limit=None):
         return pd.read_parquet(path, columns=columns).head(max(int(limit) * 256, 4096))
 
 
-def build_ec_vocab(dataset_root, vocab_path=DEFAULT_VOCAB_PATH, rebuild=False):
-    dataset_root = resolve_path(dataset_root)
-    vocab_path = resolve_path(vocab_path)
-    if vocab_path.exists() and not rebuild:
-        return json.loads(vocab_path.read_text())
+def build_ec_vocab(dataset_root, vocab_path, rebuild=False):
+    dataset_root = Path(dataset_root).resolve()
+    if Path(vocab_path).exists() and not rebuild:
+        cached = json.loads(Path(vocab_path).read_text())
+        if cached.get("policy") == VOCAB_POLICY:
+            return cached
 
     root_file = dataset_root / "enzyme_classification_dataset.parquet"
     if not root_file.exists():
@@ -205,7 +222,7 @@ def build_ec_vocab(dataset_root, vocab_path=DEFAULT_VOCAB_PATH, rebuild=False):
         "label_items": total_items,
         "usable_label_items": usable_items,
         "max_depth_counts": max_depth_counts,
-        "policy": "masked_prefix",
+        "policy": VOCAB_POLICY,
     }
     write_json(vocab_path, vocab)
     return vocab
@@ -222,10 +239,7 @@ def _ec_sort_key(value):
 
 
 def label_targets(ec_number, vocab):
-    level_maps = [
-        {label: idx for idx, label in enumerate(labels)}
-        for labels in vocab["levels"]
-    ]
+    level_maps = [{label: idx for idx, label in enumerate(labels)} for labels in vocab["levels"]]
     target_indices = [set(), set(), set(), set()]
     observed_levels = set()
     usable_labels = []
@@ -254,7 +268,6 @@ def load_hitec_records(
     parquet_path,
     split_name,
     vocab,
-    max_tokens=DEFAULT_MODEL_DIMENSION,
     limit=None,
 ):
     parquet_path = Path(parquet_path)
@@ -274,12 +287,10 @@ def load_hitec_records(
     missing_required_rows = raw_rows_read - rows_after_required_drop
 
     df["Original Entry"] = df["uniprot_id"].astype(str)
-    df["Entry"] = df["Original Entry"].map(cache_key_for_entry)
+    df["Entry"] = df["Original Entry"]
     df["Original Sequence"] = df["sequence"].map(normalize_sequence)
     df["Original Sequence Length"] = df["Original Sequence"].str.len()
-    residue_limit = max_tokens - 1
-    if residue_limit <= 0:
-        raise ValueError("max_tokens must be > 1")
+    residue_limit = MODEL_DIMENSION - 1
     df["Sequence"] = df["Original Sequence"].str[:residue_limit]
     df["Sequence Length"] = df["Sequence"].str.len()
     df = df[df["Sequence Length"] > 0].copy()
@@ -290,7 +301,10 @@ def load_hitec_records(
     aggregations = {
         "Entry": "first",
         "ec_number": lambda values: ";".join(
-            sorted(set(label for value in values for label in split_ec_labels(value)), key=_ec_sort_key)
+            sorted(
+                set(label for value in values for label in split_ec_labels(value)),
+                key=_ec_sort_key,
+            )
         ),
         "Original Sequence Length": "max",
         "Sequence Length": "max",
@@ -298,7 +312,7 @@ def load_hitec_records(
     }
     for col in OPTIONAL_METADATA_COLUMNS:
         if col in df.columns:
-            aggregations[col] = _first_non_null
+            aggregations[col] = _union_ids if col == "pdbs" else _first_non_null
 
     grouped = (
         df.groupby(["Original Entry", "Sequence"], as_index=False)
@@ -309,7 +323,7 @@ def load_hitec_records(
 
     grouped_for_processing = grouped.head(limit).copy() if limit is not None else grouped
     rows = []
-    no_label_rows = 0
+    no_full_ec_rows = 0
     dropped_vocab_prefixes = 0
     for row in progress(
         grouped_for_processing.to_dict("records"),
@@ -319,16 +333,13 @@ def load_hitec_records(
     ):
         targets = label_targets(row["ec_number"], vocab)
         if not any(targets["target_indices"]) or not targets["observed_levels"]:
-            no_label_rows += 1
+            no_full_ec_rows += 1
             continue
         if targets["dropped_labels"]:
             dropped_vocab_prefixes += len(targets["dropped_labels"])
         row["EC number"] = ";".join(targets["usable_labels"])
         row["target_indices"] = json.dumps(targets["target_indices"], separators=(",", ":"))
         row["observed_levels"] = json.dumps(targets["observed_levels"], separators=(",", ":"))
-        row["cache_key"] = row["Entry"]
-        row["sequence_sha256"] = sequence_sha256(row["Sequence"])
-        row["token_cache_path"] = ""
         rows.append(row)
 
     records = pd.DataFrame(rows)
@@ -344,7 +355,7 @@ def load_hitec_records(
         "rows_after_sequence_aggregation": int(len(grouped)),
         "rows_considered_after_limit": int(len(grouped_for_processing)),
         "rows_after_label_filter": int(len(records)),
-        "dropped_no_label_rows": int(no_label_rows),
+        "dropped_no_full_ec_rows": int(no_full_ec_rows),
         "dropped_vocab_prefixes": int(dropped_vocab_prefixes),
         "unique_entries": int(records["Entry"].nunique()) if not records.empty else 0,
         "truncated_sequences": int(
@@ -352,8 +363,7 @@ def load_hitec_records(
         )
         if not records.empty
         else 0,
-        "max_tokens": int(max_tokens),
-        "residue_limit": int(max_tokens - 1),
+        "residue_limit": int(residue_limit),
         "limit": limit,
     }
     return records, stats
@@ -365,30 +375,36 @@ def write_manifest(records, path):
     records.to_csv(path, index=False)
 
 
-def prepare_split_group(
-    group,
-    dataset_root,
-    vocab,
-    runs_root=DEFAULT_RUNS_ROOT,
-    cache_root=None,
-    max_tokens=DEFAULT_MODEL_DIMENSION,
-    model_dimension=DEFAULT_MODEL_DIMENSION,
-    limit_per_split=None,
-):
-    dataset_root = resolve_path(dataset_root)
-    run_slug = split_group_slug(group.name)
-    run_root = Path(runs_root) / run_slug
+def split_group_fingerprint(group, vocab, limit_per_split):
+    """Hash of the inputs that decide the manifests: split files, vocabulary, limit and this module's code."""
+    files = [group.path / "{}.parquet".format(name) for name in SPLIT_NAMES]
+    inputs = {
+        "files": [[str(path), path.stat().st_size, path.stat().st_mtime_ns] for path in files],
+        "vocab": vocab,
+        "limit": limit_per_split,
+        "code": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def prepare_split_group(group, dataset_root, vocab, out_root, vocab_path, limit_per_split=None):
+    run_root = split_run_root(out_root, group.name)
     manifest_root = run_root / "manifests"
+    fingerprint = split_group_fingerprint(group, vocab, limit_per_split)
+    metadata_path = run_root / "metadata.json"
+    if metadata_path.exists():
+        existing = json.loads(metadata_path.read_text())
+        if existing.get("fingerprint") == fingerprint and all(
+            Path(path).exists() for path in existing["manifests"].values()
+        ):
+            return existing
     metadata = {
-        "dataset_root": str(dataset_root),
+        "dataset_root": str(Path(dataset_root).resolve()),
         "split_group": group.name,
-        "run_slug": run_slug,
+        "run_slug": split_group_slug(group.name),
         "run_root": str(run_root),
-        "cache_root": str(cache_root) if cache_root else None,
-        "model_dimension": int(model_dimension),
-        "max_tokens": int(max_tokens),
-        "max_supported_tokens": int(model_dimension),
-        "vocab_path": str(DEFAULT_VOCAB_PATH),
+        "fingerprint": fingerprint,
+        "vocab_path": str(vocab_path),
         "output_dims": vocab["output_dims"],
         "level_starts": vocab["level_starts"],
         "manifests": {},
@@ -400,7 +416,6 @@ def prepare_split_group(
             group.path / "{}.parquet".format(split_name),
             split_name="{}/{}".format(group.name, split_name),
             vocab=vocab,
-            max_tokens=max_tokens,
             limit=limit_per_split,
         )
         if records.empty:
@@ -410,12 +425,5 @@ def prepare_split_group(
         metadata["manifests"][split_name] = str(manifest_csv)
         metadata["stats"][split_name] = stats
 
-    write_json(run_root / "metadata.json", metadata)
+    write_json(metadata_path, metadata)
     return metadata
-
-
-def load_manifest(metadata, split_name):
-    path = Path(metadata["manifests"][split_name])
-    if not path.exists():
-        raise FileNotFoundError("Missing manifest: {}".format(path))
-    return pd.read_csv(path)

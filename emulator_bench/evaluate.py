@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 from .results import (
     choose_f1_thresholds,
@@ -26,9 +26,9 @@ from .results import (
     sigmoid,
     write_care_ranked_csv,
 )
-from .train import HitecLightningModule
+from .train import HitecModule, ManifestDataset
 from .utils import (
-    DEFAULT_RUNS_ROOT,
+    DEFAULT_OUT_ROOT,
     ensure_dir,
     load_run_metadata,
     read_json,
@@ -39,48 +39,15 @@ from .utils import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a HITEC checkpoint")
+    parser = argparse.ArgumentParser(description="Evaluate a trained HIT-EC checkpoint")
     parser.add_argument("--split-group", required=True)
-    parser.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--eval-split", choices=["val", "test", "both"], default="test")
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--out_root", "--out-root", default=str(DEFAULT_OUT_ROOT))
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--rank-limit", type=int, default=50)
-    parser.add_argument("--force-thresholds", action="store_true")
-    parser.add_argument("--care-results-root", default=None)
     return parser.parse_args()
-
-
-class PredictionDataset(Dataset):
-    def __init__(self, manifest_path, total_outputs, level_starts, output_dims):
-        self.manifest_path = Path(manifest_path)
-        self.records = pd.read_csv(self.manifest_path)
-        self.total_outputs = int(total_outputs)
-        self.level_starts = list(level_starts)
-        self.output_dims = list(output_dims)
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, index):
-        row = self.records.iloc[index]
-        cached = torch.load(Path(row["token_cache_path"]), map_location="cpu")
-        tokens = cached["tokens"].long()
-        target = torch.zeros(self.total_outputs, dtype=torch.float32)
-        mask = torch.zeros(self.total_outputs, dtype=torch.float32)
-        target_indices = json.loads(row["target_indices"])
-        observed_levels = json.loads(row["observed_levels"])
-        for level in observed_levels:
-            start = self.level_starts[int(level)]
-            end = start + self.output_dims[int(level)]
-            mask[start:end] = 1.0
-        for level_indices in target_indices:
-            if level_indices:
-                target[torch.tensor(level_indices, dtype=torch.long)] = 1.0
-        return tokens, target, mask, int(index)
 
 
 def choose_device(requested):
@@ -93,17 +60,8 @@ def choose_device(requested):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def resolve_checkpoint(metadata, seed, checkpoint):
-    if checkpoint:
-        path = Path(checkpoint)
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return path.resolve()
-    train_json = seed_train_metadata_path(metadata, seed)
-    if not train_json.exists():
-        raise FileNotFoundError("Missing train metadata: {}".format(train_json))
-    train_metadata = read_json(train_json)
-    return Path(train_metadata["checkpoint"])
+def resolve_checkpoint(metadata, seed):
+    return Path(read_json(seed_train_metadata_path(metadata, seed))["checkpoint"])
 
 
 def load_vocab(metadata):
@@ -113,12 +71,9 @@ def load_vocab(metadata):
     return read_json(vocab_path)
 
 
-def predict_split(model, metadata, split_name, batch_size, num_workers, device):
-    dataset = PredictionDataset(
-        metadata["manifests"][split_name],
-        total_outputs=sum(metadata["output_dims"]),
-        level_starts=metadata["level_starts"],
-        output_dims=metadata["output_dims"],
+def predict_split(model, metadata, split_name, batch_size, num_workers, device, result_root):
+    dataset = ManifestDataset(
+        metadata["manifests"][split_name], metadata["output_dims"], metadata["level_starts"]
     )
     loader = DataLoader(
         dataset,
@@ -127,138 +82,66 @@ def predict_split(model, metadata, split_name, batch_size, num_workers, device):
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
-    logits_parts = []
-    target_parts = []
-    mask_parts = []
-    index_parts = []
-
-    model.eval()
+    logits, targets, masks = [], [], []
     with torch.no_grad():
-        for tokens, target, mask, indices in progress(
-            loader,
-            desc="{} predictions".format(split_name),
-            unit="batch",
+        for tokens, target, mask, _ in progress(
+            loader, desc="{} predictions".format(split_name), unit="batch"
         ):
-            tokens = tokens.to(device)
-            logits = model(tokens).detach().cpu().numpy()
-            logits_parts.append(logits)
-            target_parts.append(target.numpy())
-            mask_parts.append(mask.numpy())
-            index_parts.append(indices.numpy())
-
-    return {
-        "logits": np.concatenate(logits_parts, axis=0),
-        "targets": np.concatenate(target_parts, axis=0),
-        "masks": np.concatenate(mask_parts, axis=0),
-        "indices": np.concatenate(index_parts, axis=0),
+            logits.append(model(tokens.to(device)).cpu().numpy())
+            targets.append(target.numpy())
+            masks.append(mask.numpy())
+    arrays = {
+        "logits": np.concatenate(logits),
+        "targets": np.concatenate(targets),
+        "masks": np.concatenate(masks),
         "manifest": dataset.records,
     }
-
-
-def save_prediction_npz(path, arrays):
-    path = Path(path)
-    ensure_dir(path.parent)
     np.savez_compressed(
-        path,
+        result_root / "{}_logits.npz".format(split_name),
         logits=arrays["logits"],
         targets=arrays["targets"],
         masks=arrays["masks"],
-        indices=arrays["indices"],
     )
+    return arrays
 
 
-def thresholds_paths(result_root):
-    return result_root / "validation_thresholds.npy", result_root / "validation_thresholds.json"
-
-
-def load_or_select_thresholds(model, metadata, result_root, args, device, vocab, checkpoint):
-    thresholds_npy, thresholds_json = thresholds_paths(result_root)
-    if thresholds_npy.exists() and thresholds_json.exists() and not args.force_thresholds:
-        threshold_metadata = read_json(thresholds_json)
-        if threshold_metadata.get("checkpoint") == str(checkpoint):
-            thresholds = np.load(thresholds_npy)
-            return thresholds, threshold_metadata, None
-
-    val_arrays = predict_split(
-        model,
-        metadata,
-        "val",
-        args.batch_size,
-        args.num_workers,
-        device,
-    )
-    save_prediction_npz(result_root / "val_logits.npz", val_arrays)
-    val_probs = sigmoid(val_arrays["logits"])
-    thresholds, stats = choose_f1_thresholds(
-        val_probs,
-        val_arrays["targets"],
-        val_arrays["masks"],
-    )
-    np.save(thresholds_npy, thresholds)
-    threshold_metadata = {
-        "source_split": "val",
-        "checkpoint": str(checkpoint),
-        "thresholds": str(thresholds_npy),
-        "stats": stats,
-        "classes": int(len(thresholds)),
+def dropped_rows(stats):
+    """Source rows removed before the manifest: missing fields, empty sequence, or no full EC."""
+    return {
+        "source_rows": stats["raw_rows"],
+        "missing_required_fields": stats["missing_required_rows"],
+        "empty_sequence": stats["rows_after_required_drop"] - stats["rows_before_exact_dedup"],
+        "proteins_without_full_ec": stats["dropped_no_full_ec_rows"],
+        "proteins_kept": stats["rows_after_label_filter"],
     }
-    write_json(thresholds_json, threshold_metadata)
-    return thresholds, threshold_metadata, val_arrays
 
 
-def external_care_path(care_results_root, metadata, seed, eval_split):
-    return Path(care_results_root) / (
-        "{}_seed{}_{}_results_df.csv".format(metadata["run_slug"], seed, eval_split)
-    )
-
-
-def evaluate_arrays(arrays, thresholds, metadata, vocab, result_root, split_name, seed, rank_limit, care_results_root):
+def evaluate_arrays(
+    arrays, thresholds, metadata, vocab, result_root, split_name, seed, rank_limit
+):
     probs = sigmoid(arrays["logits"])
     predictions = (probs >= thresholds.reshape(1, -1)).astype(np.int32)
-    hitec_metrics = compute_hitec_metrics(
-        arrays["logits"],
-        arrays["targets"],
-        arrays["masks"],
-        thresholds,
-        vocab,
-    )
     care_csv = result_root / "{}_results_df.csv".format(split_name)
     care_df = write_care_ranked_csv(
-        arrays["manifest"],
-        probs,
-        vocab,
-        care_csv,
-        rank_limit=rank_limit,
+        arrays["manifest"], probs, vocab, care_csv, rank_limit=rank_limit
     )
-    external_csv = None
-    if care_results_root:
-        external_csv = external_care_path(care_results_root, metadata, seed, split_name)
-        write_care_ranked_csv(
-            arrays["manifest"],
-            probs,
-            vocab,
-            external_csv,
-            rank_limit=rank_limit,
-        )
-
     metrics = {
         "split_group": metadata["split_group"],
         "run_slug": metadata["run_slug"],
         "eval_split": split_name,
         "seed": int(seed),
-        "hitec": hitec_metrics,
+        "hitec": compute_hitec_metrics(
+            arrays["logits"], arrays["targets"], arrays["masks"], thresholds, vocab
+        ),
         "care_task1": compute_care_metrics(care_df),
         "supplemental": {
             "classification": compute_supplemental_classification_metrics(
-                arrays["targets"],
-                predictions,
-                arrays["masks"],
+                arrays["targets"], predictions, arrays["masks"]
             ),
             "ranking": compute_supplemental_ranking_metrics(care_df),
         },
         "artifacts": {
             "care_ranked_csv": str(care_csv),
-            "external_care_ranked_csv": str(external_csv) if external_csv else None,
             "logits_npz": str(result_root / "{}_logits.npz".format(split_name)),
         },
     }
@@ -268,65 +151,53 @@ def evaluate_arrays(arrays, thresholds, metadata, vocab, result_root, split_name
 
 def main():
     args = parse_args()
-    metadata = load_run_metadata(args.split_group, args.runs_root)
-    vocab = load_vocab(metadata)
+    metadata = load_run_metadata(args.split_group, args.out_root)
+    vocab = read_json(metadata["vocab_path"])
     result_root = ensure_dir(seed_results_root(metadata, args.seed))
-    checkpoint = resolve_checkpoint(metadata, args.seed, args.checkpoint)
-    if not checkpoint.exists():
-        raise FileNotFoundError("Missing checkpoint: {}".format(checkpoint))
+    checkpoint = resolve_checkpoint(metadata, args.seed)
 
     device = choose_device(args.device)
-    model = HitecLightningModule.load_from_checkpoint(str(checkpoint), map_location=device)
-    model.to(device)
-
-    thresholds, threshold_metadata, cached_val_arrays = load_or_select_thresholds(
-        model,
-        metadata,
-        result_root,
-        args,
-        device,
-        vocab,
-        checkpoint,
+    model = (
+        HitecModule.load_from_checkpoint(str(checkpoint), map_location=device).to(device).eval()
     )
 
-    eval_splits = ["val", "test"] if args.eval_split == "both" else [args.eval_split]
-    metrics = []
-    for split_name in eval_splits:
-        if split_name == "val" and cached_val_arrays is not None:
-            arrays = cached_val_arrays
-        else:
-            arrays = predict_split(
-                model,
-                metadata,
-                split_name,
-                args.batch_size,
-                args.num_workers,
-                device,
-            )
-            save_prediction_npz(result_root / "{}_logits.npz".format(split_name), arrays)
-        metrics.append(
-            evaluate_arrays(
-                arrays,
-                thresholds,
-                metadata,
-                vocab,
-                result_root,
-                split_name,
-                args.seed,
-                args.rank_limit,
-                args.care_results_root,
-            )
+    # Per-class thresholds maximise F1 on the validation split (paper, "Repeated stratified hold-out").
+    arrays = {
+        split: predict_split(
+            model, metadata, split, args.batch_size, args.num_workers, device, result_root
         )
-
-    write_json(
-        result_root / "evaluation_summary.json",
-        compact_evaluation_summary(
-            metrics,
-            checkpoint=str(checkpoint),
-            thresholds=threshold_metadata,
-        ),
+        for split in ("val", "test")
+    }
+    thresholds, stats = choose_f1_thresholds(
+        sigmoid(arrays["val"]["logits"]), arrays["val"]["targets"], arrays["val"]["masks"]
     )
-    print("[emulator_bench] evaluation summary: {}".format(result_root / "evaluation_summary.json"), flush=True)
+    np.save(result_root / "validation_thresholds.npy", thresholds)
+    metrics = [
+        evaluate_arrays(
+            arrays[split],
+            thresholds,
+            metadata,
+            vocab,
+            result_root,
+            split,
+            args.seed,
+            args.rank_limit,
+        )
+        for split in ("val", "test")
+    ]
+    summary = compact_evaluation_summary(
+        metrics,
+        checkpoint=str(checkpoint),
+        thresholds={"source_split": "val", "stats": stats, "classes": int(len(thresholds))},
+    )
+    summary["dropped_rows"] = {
+        split: dropped_rows(metadata["stats"][split]) for split in ("train", "val", "test")
+    }
+    write_json(result_root / "evaluation_summary.json", summary)
+    print(
+        "[emulator_bench] evaluation summary: {}".format(result_root / "evaluation_summary.json"),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

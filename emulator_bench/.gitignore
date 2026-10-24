@@ -1,9 +1,2 @@
-cache/
-runs/
-logs/
-results_summary/
-vocab/
 __pycache__/
 *.py[cod]
-.pytest_cache/
-lightning_logs/

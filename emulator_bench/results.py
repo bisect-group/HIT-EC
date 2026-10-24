@@ -6,12 +6,12 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import precision_recall_curve, precision_recall_fscore_support
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 from .dataset_adapter import _ec_sort_key, ec_prefixes, parse_label_set
 
