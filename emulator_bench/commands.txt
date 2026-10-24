@@ -1,0 +1,35 @@
+# Run all commands from the submodule root: /home/adhil/github/EMULaToR/baselines/HITEC
+PY=/home/adhil/.conda/envs/mldb/bin/python
+
+# Build the vocabulary and manifests for every default split folder (safe to rerun; skips unchanged splits).
+$PY -m emulator_bench.prepare_splits
+
+# Train and evaluate every split folder and seed (666 777 888) on GPUs 0 1 2, one run per GPU.
+$PY -m emulator_bench.run_benchmarks --gpus 0 1 2 --runs_per_gpu 1
+
+# Split a run over 24 h jobs: stop cleanly before the job ends (exit code 75 = unfinished, rerun to resume).
+$PY -m emulator_bench.run_benchmarks --gpus 0 --stop-at $(( $(date +%s) + 23*3600 ))
+
+# One split folder, one seed.
+$PY -m emulator_bench.run_benchmarks --gpus 0 --split-group enzyme_structure_splits/threshold_0.85 --seeds 666
+
+# Single steps.
+$PY -m emulator_bench.train --split-group uniprot_time_splits --seed 666
+$PY -m emulator_bench.evaluate --split-group uniprot_time_splits --seed 666
+
+# Optional: fused SDPA attention (off by default) and 4 loader workers (default).
+$PY -m emulator_bench.run_benchmarks --gpus 0 --sdpa --num-workers 4
+
+# GPU probes (one GPU each, JSON to --out).
+$PY -m emulator_bench.probes.attention_probe --device cuda:0 --out /path/attention_probe.json
+$PY -m emulator_bench.probes.exactness_probe --device cuda:0 --out /path/exactness_probe.json
+
+# Mean and std over seeds.
+$PY -m emulator_bench.aggregate_results
+
+# Smoke test: 64 rows per split, small batch, short SWA schedule. Use a scratch --out_root.
+$PY -m emulator_bench.run_benchmarks --out_root /path/to/scratch --split-group enzyme_structure_splits/threshold_0.85 \
+  --seeds 666 --gpus 3 --limit-per-split 64 --batch-size 4 --epochs 6 --swa-epoch-start 2 --swa-annealing-epochs 2
+
+# Tests.
+$PY -m pytest tests

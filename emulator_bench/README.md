@@ -1,115 +1,36 @@
-# HITEC EMULaToR Adapter
+# HIT-EC EMULaToR wrapper
 
-This wrapper adapts HITEC to the EMULaToR enzyme classification dataset layout.
-It keeps HITEC sequence-only: PDB columns are retained as manifest metadata but are
-not model inputs.
+Multi-seed evaluation of HIT-EC with its original settings on the default EMULaToR EC classification splits.
+The wrapper reads `data/processed/datasets/enzyme_classification_dataset` and never writes there.
+All outputs go to `--out_root` (default `<EMULaToR>/outputs/baselines/HITEC`).
 
-## Dataset Mapping
+Split folders come from disk: `random_splits_grouped_sequence`, `uniprot_time_splits`, and every
+`enzyme_sequence_splits/threshold_*` and `enzyme_structure_splits/threshold_*`. `backup_*` folders are never read.
+Each run goes to `<out_root>/enzyme_classification/<split_group>/<split_name>/seed_<s>/`.
+A flat split group uses `all` as split name. Summaries go to `<out_root>/enzyme_classification/`.
 
-Expected dataset root:
+Training uses the settings of the released code: AdamW (lr 8.75e-5, layer-wise lr x0.9, weight decay 0.01),
+80 epochs, fp16 mixed precision, SWA from epoch 49 (30 annealing epochs, lr 3e-7), attention heads 2,
+dropout 0.1, beta 0.59, dimension 1024. Sequences are cut to 1023 residues plus a BOS token.
+Only fully specified EC numbers (four levels, no "-") are used in train, val and test. A partial EC is dropped
+from a protein's labels, and a protein left without a full EC is dropped and counted per split in `metadata.json` and
+`evaluation_summary.json` (`dropped_rows`). The label vocabulary holds only full ECs and their prefixes.
+Class thresholds maximise F1 on the validation split. The test split reuses them.
 
-```bash
-../../data/processed/datasets/enzyme_classification_dataset
-```
-
-Each split group must contain `train.parquet`, `val.parquet`, and `test.parquet`.
-The wrapper discovers `random_splits`, sequence, structure, time, and EC hierarchy
-split groups automatically.
-
-Required columns are `uniprot_id`, `sequence`, and `ec_number`. Optional columns
-such as `pdbs`, `pdb_source`, and `pdb_type` are retained after per-file
-deduplication for traceability.
-
-## Cache And Manifests
-
-`cache_features.py` writes:
-
-- `emulator_bench/vocab/ec_vocab.json`
-- `emulator_bench/cache/tokens/<uniprot_id>.pt`
-- `emulator_bench/runs/<split_group>/manifests/{train,val,test}.csv`
-- `emulator_bench/runs/<split_group>/metadata.json`
-
-Sequences are uppercased, unknown residues are mapped to `X`, BOS token `22` is
-prepended, and tensors are truncated/padded to the model's supported positional
-length. For HITEC's documented config this defaults to `1024`; use
-`--model-dimension` to change the model limit and optional `--max-tokens` to use a
-shorter token length. Partial EC labels use masked-prefix training, so `3.2.2.-`
-observes levels 1-3 and masks level 4.
-
-## Commands
-
-Prepare one split group:
+Default seeds are 666, 777 and 888. Run from this folder (`baselines/HITEC`) with the mldb Python:
 
 ```bash
-conda run -n hitec python -m emulator_bench.cache_features \
-  --dataset-root ../../data/processed/datasets/enzyme_classification_dataset \
-  --split-group random_splits
+python -m emulator_bench.run_benchmarks --gpus 0 1 2 --runs_per_gpu 1
+python -m emulator_bench.run_benchmarks --gpus 0 --split-group uniprot_time_splits
+python -m emulator_bench.aggregate_results
 ```
 
-Train one seed:
+`run_benchmarks` skips finished (split, seed) runs. Training resumes from `checkpoint_last.pt` (written every epoch) after an interruption.
+`--stop-at <unix time>` (on `train` and `run_benchmarks`) ends training after an epoch when the next one, at 1.2 x the longest epoch so far, may pass that time. The checkpoint is written first. Nothing else is written: no `lastmodel.pth`, no evaluation. Both scripts then exit with code 75. Rerun the same command in the next job to resume.
+A run with finished training but no `evaluation_summary.json` only runs the evaluation. `prepare_splits` skips split folders whose inputs did not change.
+`lastmodel.pth` is the final (SWA) model. `--amp` trains in bf16 instead of the original fp16. `--sdpa` (off by default) uses `F.scaled_dot_product_attention` in the full attention layers. `--num-workers` defaults to 4. Single steps:
+`emulator_bench.prepare_splits`, `emulator_bench.train`, `emulator_bench.evaluate`.
+Do not start two `prepare_splits` runs for the same split folder at once.
 
-```bash
-conda run -n hitec python -m emulator_bench.train \
-  --split-group random_splits \
-  --seed 1234 \
-  --epochs 80 \
-  --precision auto
-```
-
-Evaluate one seed:
-
-```bash
-conda run -n hitec python -m emulator_bench.evaluate \
-  --split-group random_splits \
-  --seed 1234 \
-  --eval-split test
-```
-
-Queue cache, train, and evaluate with `ts`:
-
-```bash
-conda run -n hitec python -m emulator_bench.queue_pipeline \
-  --dataset-root ../../data/processed/datasets/enzyme_classification_dataset \
-  --split-group random_splits \
-  --seed 1234 \
-  --epochs 80 \
-  --wait
-```
-
-Smoke test:
-
-```bash
-CUDA_VISIBLE_DEVICES=3 conda run -n hitec python -m emulator_bench.queue_pipeline \
-  --dataset-root ../../data/processed/datasets/enzyme_classification_dataset \
-  --split-group random_splits \
-  --epochs 1 \
-  --seed 1234 \
-  --limit-per-split 16 \
-  --cuda-visible-devices 3 \
-  --wait
-```
-
-Aggregate metrics:
-
-```bash
-conda run -n hitec python -m emulator_bench.aggregate_results
-```
-
-## Metrics
-
-Primary HITEC-style metrics include micro/macro precision, recall, F1, exact-match
-accuracy, and per-level micro/macro metrics. Validation predictions select
-per-class F1-maximizing thresholds; test metrics reuse those thresholds.
-
-The evaluator also writes CARE Task 1 ranked CSVs with metadata columns followed
-by rank columns `0,1,2,...`. CARE hierarchical accuracy is reported at levels 1-4
-for `k=1` and `k=20`. Supplemental ranking metrics include MRR and hit@1, hit@3,
-hit@5, hit@10, and hit@20.
-
-## Notes
-
-- Environment name: `hitec`.
-- Queue command: `ts`.
-- Default seeds: `1234`, `2345`, `3456`.
-- Default real-run epochs: `80`.
-- Default rank output columns: top 50 full EC labels, enough for CARE `k=20`.
+`--batch-size` (default 64) is not given by the paper. The original default of 2 is too slow. `--limit-per-split`, `--epochs`, `--swa-epoch-start` and `--swa-annealing-epochs` are for smoke tests only.
+See `REPORT.md`, `commands.txt` and `default_hparams.json`.
