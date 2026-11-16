@@ -1,0 +1,12 @@
+# Run from the fork root. PY is a python with the fork's requirements (README). The paper commands; emulator_bench/run.sh runs them all.
+# Run order of run.sh: prepare, train (also evaluates), aggregate. Finished runs are skipped; training resumes from checkpoint_last.pt.
+$PY -m emulator_bench.prepare_splits
+$PY -m emulator_bench.run_benchmarks --seeds 666 777 888 --gpus 0 1 2 --runs_per_gpu 1
+$PY -m emulator_bench.aggregate_results
+
+# One run by hand
+$PY -m emulator_bench.train --split-group uniprot_time_splits --seed 666
+$PY -m emulator_bench.evaluate --split-group uniprot_time_splits --seed 666
+
+# Tests
+$PY -m pytest tests

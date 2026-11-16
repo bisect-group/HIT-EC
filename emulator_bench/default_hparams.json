@@ -1,0 +1,39 @@
+{
+  "_note": "Source paths are relative to baselines/HITEC. 'code' = training/infer_training.py (released code). The released code wins over the paper.",
+  "model": {
+    "attention_heads": {"value": 2, "source": "code training/infer_training.py:103"},
+    "dropout": {"value": 0.1, "source": "code training/infer_training.py:104"},
+    "beta": {"value": 0.59, "source": "code training/infer_training.py:105"},
+    "dimension": {"value": 1024, "source": "code training/infer_training.py:109"},
+    "vocab_size": {"value": 23, "source": "code training/infer_training.py:14"},
+    "max_sequence_tokens": {"value": 1024, "source": "BOS plus 1023 residues; model dimension equals the positional table length"}
+  },
+  "optimizer": {
+    "name": {"value": "AdamW", "source": "code training/infer_training.py:74"},
+    "lr": {"value": 8.75e-5, "source": "code training/infer_training.py:106"},
+    "layer_lr_multipliers": {
+      "value": {"embeddings_and_enc_1": 0.729, "enc_2": 0.81, "enc_3": 0.9, "enc_4": 1.0, "linear_heads": 1.05},
+      "source": "code training/infer_training.py:32-72"
+    },
+    "weight_decay": {"value": {"default": 0.01, "norm_and_bias": 0.0}, "source": "code training/infer_training.py:37"},
+    "scheduler": {"value": null, "source": "code training/infer_training.py:75-79 returns it under the key 'scheduler'. Lightning 2.6.1 reads only 'lr_scheduler', warns and ignores it."}
+  },
+  "training": {
+    "epochs": {"value": 80, "source": "code training/infer_training.py:115"},
+    "precision": {"value": "fp16 mixed", "source": "code training/infer_training.py:115"},
+    "swa": {
+      "value": {"swa_lrs": 3e-7, "swa_epoch_start": 49, "annealing_epochs": 30},
+      "source": "code training/infer_training.py:114"
+    },
+    "loss": {"value": "BCE with logits over observed entries, mean over observed entries", "source": "code training/infer_training.py:87-91"},
+    "final_weights": {"value": "SWA weights after the last epoch", "source": "code training/infer_training.py:114 saves every epoch and selects none"},
+    "batch_size": {"value": 64, "source": "wrapper choice; the paper and code do not give it"},
+    "num_workers": {"value": 4, "source": "wrapper choice; loader order is seeded, so results do not change"},
+    "sdpa": {"value": false, "source": "wrapper opt-in flag --sdpa; same function as the manual attention"},
+    "seeds": {"value": [666, 777, 888], "source": "wrapper default; the paper gives none"}
+  },
+  "evaluation": {
+    "thresholds": {"value": "per class, maximise F1 on the validation split; classes without observed or positive validation rows get 1.0", "source": "paper, Repeated stratified hold-out"},
+    "ranking": {"value": "CARE ranked CSV, rank limit 50", "source": "wrapper"}
+  }
+}
